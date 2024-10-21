@@ -6,6 +6,8 @@ variable "aws_region" {
   default = "us-west-2"
 }
 
+### Configuration of the S3 buckets, one for original images and another for thumbnails
+
 #################################
 # S3 Buckets for Image Storage  #
 #################################
@@ -17,6 +19,8 @@ resource "aws_s3_bucket" "source_images" {
 resource "aws_s3_bucket" "thumbnails" {
   bucket = "stori-thumbnail-thumbnails"
 }
+
+### IAM Roles and Policies so the interacion between modules it's independent
 
 ########################################
 # IAM Roles and Policies Configuration #
@@ -74,6 +78,60 @@ resource "aws_iam_role_policy" "rekognition_access_policy" {
   })
 }
 
+# IAM Role for Glue
+resource "aws_iam_role" "glue_service_role" {
+  name = "glue_service_role"
+  assume_role_policy = jsonencode({
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": { "Service": "glue.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "glue_s3_access" {
+  role       = aws_iam_role.glue_service_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "glue_redshift_access" {
+  role       = aws_iam_role.glue_service_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonRedshiftFullAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "glue_rds_access" {
+  role       = aws_iam_role.glue_service_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonRDSFullAccess"
+}
+
+resource "aws_iam_policy" "glue_policy" {
+  name = "glue_access_policy"
+  policy = jsonencode({
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "glue:GetConnection",
+          "glue:GetDatabase",
+          "glue:GetTable",
+          "glue:CreateTable",
+          "glue:UpdateTable"
+        ],
+        "Resource": "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "glue_policy_attachment" {
+  role       = aws_iam_role.glue_service_role.name
+  policy_arn = aws_iam_policy.glue_policy.arn
+}
+
+### Security Group that makes possible to connect to the database publicly, it should be modified before production.
 
 #########################
 # Security Group Setup  #
@@ -104,6 +162,8 @@ resource "aws_security_group" "rds_security_group" {
 }
 
 
+### Configuration of the MySQL Instance that allows create the database
+
 ###################################
 # RDS MySQL Instance Configuration #
 ###################################
@@ -125,6 +185,100 @@ resource "aws_db_instance" "mysql_db" {
   }
 }
 
+### Configuration of a Redshift Cluster to admin the databases. 
+
+##################################
+# Redshift Cluster Configuration #
+##################################
+
+resource "aws_redshift_cluster" "image_tags_cluster" {
+  cluster_identifier = "image-tags-cluster"
+  node_type          = "dc2.large"
+  master_username    = "admin"
+  master_password    = "RedshiftPassword123"
+  cluster_type       = "single-node"
+  skip_final_snapshot = true
+
+  tags = {
+    Name = "image-tags-cluster"
+  }
+}
+
+### Configuration of the Glue Database Catalog, it's unused because a limitation in the VPC configuration of redshift
+
+##############################
+# Glue Database Configuration #
+##############################
+
+resource "aws_glue_catalog_database" "rds_metadata_database" {
+  name = "rds_metadata"
+}
+
+### Conection of Glue with the RDS MySQL Database, the connection its available.
+
+#########################
+# Glue Connection Setup #
+#########################
+
+resource "aws_glue_connection" "mysql_connection" {
+  name = "mysql-connection"
+  connection_properties = {
+    "JDBC_CONNECTION_URL" : "jdbc:mysql://${aws_db_instance.mysql_db.endpoint}:3306/images_metadata"
+    "USERNAME"            : "dbadmin"
+    "PASSWORD"            : "MySQLPassword123"
+  }
+
+  physical_connection_requirements {
+    security_group_id_list = [aws_security_group.rds_security_group.id]
+    availability_zone      = "us-west-2a"
+  }
+}
+
+### Crawler for the Glue Configutation with the scheduler running everyday at midnight.
+
+##############################
+# Glue Crawler Configuration #
+##############################
+
+#resource "aws_glue_crawler" "rds_crawler" {
+#  name          = "rds-crawler"
+#  role          = aws_iam_role.glue_service_role.arn
+#  database_name = aws_glue_catalog_database.rds_metadata_database.name
+
+#  jdbc_target {
+#    connection_name = aws_glue_connection.mysql_connection.name
+#    path            = "images_metadata/image_tags"  # Schema and table path
+#  }
+
+  # Optional: Configure crawler schedule (e.g., every 24 hours)
+#  schedule = "cron(0 0 * * * *)"  # Optional, run every day at midnight UTC
+#}
+
+### Job configuration in AWS Glue. Definition of temporal storage.
+
+#############################
+# Glue ETL Job Configuration #
+#############################
+
+resource "aws_glue_job" "rds_to_redshift_job" {
+  name        = "rds-to-redshift-job"
+  role_arn    = aws_iam_role.glue_service_role.arn
+  command {
+    name            = "glueetl"
+    python_version  = "3"
+    script_location = "s3://stori-thumbnail-thumbnails/glue-scripts/transfer_data.py"
+  }
+
+  default_arguments = {
+    "--TempDir" = "s3://stori-thumbnail-thumbnails/glue-temp/"
+  }
+
+  connections = [aws_glue_connection.mysql_connection.name]
+  max_retries = 1
+}
+
+### Layers of Pillow and MySQL connector that allows the usage of the librarys using AWS Lambda
+
 ############################
 # Lambda Layer for Pillow  #
 ############################
@@ -145,6 +299,9 @@ resource "aws_lambda_layer_version" "mysql_connector_layer" {
   layer_name       = "mysql-connector-layer"
   compatible_runtimes = ["python3.9"]
 }
+
+
+### Configuration of the Lambda Funcion and definition of enviroment variables to connect with the MySQL Database
 
 ############################
 # Lambda Function Setup    #
@@ -174,6 +331,8 @@ resource "aws_lambda_function" "thumbnail_generator" {
     }
   }
 }
+
+### Setup of the API Gateway and it's PUT method has a lambda integration to the integration.
 
 #########################
 # API Gateway Setup     #
@@ -211,6 +370,8 @@ resource "aws_api_gateway_deployment" "api_deployment" {
   depends_on  = [aws_api_gateway_integration.lambda_integration]
 }
 
+### CloudWatch allow to review the logs of the processes.
+
 #########################
 # CloudWatch Log Groups #
 #########################
@@ -224,6 +385,8 @@ resource "aws_cloudwatch_log_group" "api_gateway_log_group" {
   name              = "/aws/api-gateway/thumbnail-api"
   retention_in_days = 7
 }
+
+### S3 notification that triggers the Lambda Function
 
 ##################################
 # S3 Notification to Invoke Lambda #

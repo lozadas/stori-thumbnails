@@ -12,7 +12,7 @@ import datetime
 s3 = boto3.client('s3')
 rekognition = boto3.client('rekognition')
 
-# Get environment variables
+# Get environment variables, bypassed so it can be used in local testing
 dest_bucket = os.environ['DEST_BUCKET']
 rds_host = "terraform-20241020073130298600000001.creug64m4trc.us-west-2.rds.amazonaws.com"
 rds_user = "dbadmin"
@@ -85,13 +85,13 @@ def upload_thumbnail_to_s3(thumbnail, source_key):
     s3.put_object(Bucket=dest_bucket, Key=thumbnail_key, Body=thumbnail, ContentType='image/jpeg')
     return f"https://{dest_bucket}.s3.amazonaws.com/{thumbnail_key}"
 
-def insert_metadata_into_mysql(source_key, tags, thumbnail_url, width, height):
-    """Insert tags metadata into the MySQL database."""
+def insert_metadata_into_mysql(source_key, tags, thumbnail_url, width, height,size):
+    """Insert metadata into the MySQL database."""
     conn = get_db_connection()
     cursor = conn.cursor()
     insert_image_tags_sql = """
-        INSERT INTO image_tags (image_key, tags, processed_at)
-        VALUES (%s, %s, %s);
+        INSERT INTO image_tags (image_key, tags)
+        VALUES (%s, %s);
     """
     insert_image_url_sql = """
         INSERT INTO image_url (image_key, thumbnail_url)
@@ -101,10 +101,15 @@ def insert_metadata_into_mysql(source_key, tags, thumbnail_url, width, height):
         INSERT INTO image_size (image_key, original_width, original_height)
         VALUES (%s, %s, %s);
     """
+    insert_file_size_sql = """
+        INSERT INTO file_size (image_key, size)
+        VALUES (%s, %s);
+    """
     for tag in tags:
-        cursor.execute(insert_image_tags_sql, (source_key, tag, datetime.datetime.now()))
+        cursor.execute(insert_image_tags_sql, (source_key, tag))
     cursor.execute(insert_image_url_sql, (source_key, thumbnail_url))
     cursor.execute(insert_image_size_sql, (source_key, width, height))
+    cursor.execute(insert_file_size_sql, (source_key, size))
     conn.commit()
     cursor.close()
     conn.close()
@@ -130,6 +135,9 @@ def lambda_handler(event, context):
         img = Image.open(io.BytesIO(image_content))
         width, height = img.size
 
+        # Get the size of the file in mega bytes
+        size = len(image_content) / 1024 / 1024
+
         # Rename the image key to include the upload datetime and remove spaces or special characters
         upload_datetime = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
         clean_source_key = re.sub(r'\W+', '_', source_key)
@@ -139,7 +147,7 @@ def lambda_handler(event, context):
         thumbnail_url = upload_thumbnail_to_s3(thumbnail, thumbnail_key)
         
         # Ensure the MySQL table exists
-        insert_metadata_into_mysql(source_key, tags, thumbnail_url, width, height)
+        insert_metadata_into_mysql(source_key, tags, thumbnail_url, width, height, size)
 
         print("Creada la tabla")
         # Insert metadata into MySQL
